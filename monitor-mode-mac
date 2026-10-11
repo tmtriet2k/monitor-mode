@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Samsung S34CG50 HDMI/PBP control on macOS through BetterDisplay.
+
+The Mac is on HDMI 1 by default. Requires Python 3 and a running BetterDisplay
+with CLI integration and DDC enabled. No network access or Hyprland required.
+"""
+
+import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
+import fcntl
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+INPUTS = {"hdmi1": 0x11, "hdmi2": 0x12}
+APP = "/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay"
+
+
+class DDCError(RuntimeError):
+    """The local backend could not complete a DDC operation."""
+
+
+class HandoffUncertain(RuntimeError):
+    """The other input may have been selected but Mac access was lost."""
+
+
+def integer(text):
+    # Do not extract arbitrary digits from logs or multiple-display responses.
+    text = text.strip()
+    if re.fullmatch(r"0x[0-9a-fA-F]+", text):
+        value = int(text, 16)
+    elif re.fullmatch(r"[0-9]+(?:\.0+)?", text):
+        value = int(text.split(".")[0])
+    else:
+        raise RuntimeError("Expected one numeric BetterDisplay result; no value was inferred.")
+    if not 0 <= value <= 0xffff:
+        raise RuntimeError("BetterDisplay result is outside the 16-bit VCP range.")
+    return value
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    pbp: bool
+    source: int
+    secondary: int
+    desktop_mode: int | None
+
+
+class Monitor:
+    def __init__(self, executable, selector, local_input, resolution=True):
+        self.executable = executable
+        self.selector = selector
+        self.local_input = local_input
+        self.resolution = resolution
+
+    def command(self, operation, *parameters):
+        return [self.executable, operation, *self.selector, *parameters]
+
+    def run(self, operation, *parameters):
+        try:
+            result = subprocess.run(self.command(operation, *parameters),
+                                    text=True, capture_output=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise DDCError("BetterDisplay could not respond. Check that it is running with CLI access enabled.") from error
+        if result.returncode:
+            raise DDCError("BetterDisplay rejected the request. Check the selected display and its DDC support.")
+        return result.stdout.strip()
+
+    def read(self, code):
+        for attempt in range(3):
+            try:
+                return integer(self.run("get", "--ddc", f"--vcp=0x{code:02X}", "--value"))
+            except DDCError:
+                if attempt == 2:
+                    raise
+                time.sleep(1)
+
+    def write(self, code, value):
+        self.run("set", "--ddc", f"--vcp=0x{code:02X}", f"--value=0x{value:04X}")
+
+    def pbp(self):
+        value = self.read(0xE2)
+        if value not in (0x3100, 0x3101):
+            raise RuntimeError(f"Unexpected S34CG50 PBP value 0x{value:04x}; switching stopped.")
+        return bool(value & 1)
+
+    def verify(self, check, message):
+        for attempt in range(6):
+            try:
+                if check():
+                    return
+            except DDCError:
+                pass
+            if attempt < 5:
+                time.sleep(1)
+        raise DDCError(message)
+
+    def set_pbp(self, enabled, verify=True):
+        self.write(0xE2, int(enabled))
+        time.sleep(3)
+        if verify:
+            self.verify(lambda: self.pbp() == enabled, "PBP switch could not be verified.")
+
+    def set_input(self, source, force=False):
+        if not force and self.read(0x60) == source:
+            return
+        self.write(0x60, source)
+        time.sleep(2)
+        self.verify(lambda: self.read(0x60) == source, "HDMI input switch could not be verified.")
+
+    def set_secondary(self, source):
+        if self.read(0xE3) & 0xff == source:
+            return
+        self.write(0xE3, 0x0100 | source)
+        time.sleep(2)
+        self.verify(lambda: self.read(0xE3) & 0xff == source,
+                    "Secondary PBP input could not be verified.")
+
+    def set_resolution(self, pbp):
+        if not self.resolution:
+            return
+        expected = "1720x1440" if pbp else "3440x1440"
+        self.run("set", f"--resolution={expected}", "--hiDPI=off")
+        self.verify(lambda: self.run("get", "--resolution") == expected,
+                    f"Mac desktop did not reach {expected}.")
+
+    def snapshot(self):
+        pbp = self.pbp()
+        source = self.read(0x60)
+        secondary = self.read(0xE3) & 0xff
+        if source not in (0x11, 0x12, 0x0f) or secondary not in (0x00, 0x01, 0x10):
+            raise RuntimeError("Unexpected monitor input state; no controls changed.")
+        mode = integer(self.run("get", "--displayModeNumber")) if self.resolution else None
+        return Snapshot(pbp, source, secondary, mode)
+
+    def restore(self, previous):
+        self.set_pbp(True)
+        self.set_input(previous.source)
+        self.set_secondary(previous.secondary)
+        if not previous.pbp:
+            self.set_pbp(False, verify=False)
+            # Force input selection AFTER disabling PBP.
+            self.write(0x60, previous.source)
+            time.sleep(2)
+        if previous.pbp or previous.source == self.local_input:
+            if previous.desktop_mode is not None:
+                self.run("set", f"--displayModeNumber={previous.desktop_mode}")
+
+    def switch(self, mode):
+        # Obtain a complete recoverable state before any writes.
+        previous = self.snapshot()
+        target_pbp = not previous.pbp if mode == "toggle" else mode == "pbp"
+        target_source = INPUTS.get(mode, self.local_input)
+        try:
+            if not previous.pbp:
+                self.set_pbp(True)
+            # Keep the Mac as primary while preparing full screen so that
+            # disabling PBP does not hide its DDC connection prematurely.
+            self.set_input(0x11 if target_pbp else self.local_input)
+            self.set_secondary(0x01 if target_pbp else (0x01 if self.local_input == 0x11 else 0x00))
+            if target_pbp:
+                self.verify(lambda: self.read(0xE3) == 0x0001,
+                            "PBP did not restore the HDMI 1 + HDMI 2 pair.")
+                self.set_resolution(True)
+                print("PBP verified: HDMI 1 + HDMI 2.")
+                return
+            self.set_pbp(False, verify=False)
+            if target_source != self.local_input:
+                # Handoff may immediately remove this Mac from BetterDisplay.
+                # Do not retry or roll back solely because readback disappears.
+                try:
+                    self.write(0x60, target_source)
+                except DDCError as error:
+                    raise HandoffUncertain("HDMI handoff outcome is unknown. Check the monitor menu "
+                                           "or other computer; no automatic rollback was sent.") from error
+                print(f"Full-screen HDMI {1 if target_source == 0x11 else 2} command sent; "
+                      "verify on the other computer or monitor menu. Mac readback may disappear.")
+                return
+            self.set_input(target_source, force=True)
+            self.verify(lambda: not self.pbp(), "Full-screen mode could not be verified.")
+            self.set_resolution(False)
+            print(f"Full-screen HDMI {1 if target_source == 0x11 else 2} verified.")
+        except HandoffUncertain:
+            raise
+        except (Exception, KeyboardInterrupt):
+            print("Switch failed; attempting to restore the previous state...", file=sys.stderr)
+            try:
+                self.restore(previous)
+            except Exception:
+                print("Recovery could not be completed. Restore PBP using the monitor menu.", file=sys.stderr)
+            raise
+
+    def status(self):
+        pbp = self.pbp()
+        source = self.read(0x60)
+        text = f"Samsung: {'PBP' if pbp else 'full screen'}; primary: 0x{source:02x}"
+        if pbp:
+            text += f"; second input index: 0x{self.read(0xE3) & 0xff:02x}"
+        print(text)
+        print("Mac resolution: " + self.run("get", "--resolution"))
+
+    def plan(self, mode):
+        pbp = mode == "pbp"
+        source = INPUTS.get(mode, self.local_input)
+        commands = [(0xE2, 1), (0x60, 0x11 if pbp else self.local_input),
+                    (0xE3, 0x0101 if pbp or self.local_input == 0x11 else 0x0100)]
+        if not pbp:
+            commands += [(0xE2, 0), (0x60, source)]
+        print("Dry run: no commands sent. Actual switching first reads and saves the current state.")
+        for code, value in commands:
+            print(f"DDC write: VCP 0x{code:02X} = 0x{value:04X}")
+        if self.resolution and (pbp or source == self.local_input):
+            print("Mac resolution: " + ("1720x1440" if pbp else "3440x1440") + " (HiDPI off)")
+
+
+@contextmanager
+def switch_lock():
+    directory = Path.home() / "Library/Application Support/monitor-mode"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (directory / "switch.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another Mac monitor-mode switch is already running.")
+        yield
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", nargs="?", default="status",
+                        choices=("hdmi1", "hdmi2", "full", "pbp", "toggle", "status", "list"))
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--display", help="exact display UUID from the list command")
+    target.add_argument("--serial", help="alphanumeric monitor serial; fallback: MONITOR_SERIAL")
+    parser.add_argument("--local-input", choices=("hdmi1", "hdmi2"), default="hdmi1",
+                        help="Mac HDMI port (default: hdmi1); full uses this input")
+    parser.add_argument("--backend", default=os.environ.get("MONITOR_MAC_BACKEND", APP),
+                        help="BetterDisplay app executable or existing betterdisplaycli")
+    parser.add_argument("--no-resolution", action="store_true", help="leave Mac resolution to macOS")
+    parser.add_argument("--dry-run", action="store_true", help="print a switch plan without calling BetterDisplay")
+    args = parser.parse_args(argv)
+    serial = args.serial or (None if args.display else os.environ.get("MONITOR_SERIAL"))
+    display = args.display or (None if serial else os.environ.get("MONITOR_MAC_DISPLAY"))
+    if args.mode != "list" and not (serial and serial.strip() or display and display.strip()):
+        parser.error("select a monitor with --display / MONITOR_MAC_DISPLAY or --serial / MONITOR_SERIAL")
+    if display and not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", display):
+        parser.error("--display must be one UUID from the list command")
+    if serial and (not re.fullmatch(r"[A-Za-z0-9_-]+", serial) or serial == "YOUR_MONITOR_SERIAL"):
+        parser.error("use your actual alphanumeric serial, without spaces or placeholders")
+    if args.dry_run and args.mode in ("status", "list", "toggle"):
+        parser.error("--dry-run requires hdmi1, hdmi2, full, or pbp")
+    selector = [f"--UUID={display}"] if display else ([f"--alphanumericSerial={serial}"] if serial else [])
+    monitor = Monitor(args.backend, selector, INPUTS[args.local_input], not args.no_resolution)
+    if args.dry_run:
+        monitor.plan(args.mode)
+        return
+    if sys.platform != "darwin":
+        raise RuntimeError("This companion runs on macOS. Use --dry-run to inspect a plan elsewhere.")
+    if not shutil.which(args.backend):
+        raise RuntimeError("BetterDisplay executable missing; set --backend to its installed app executable.")
+    if args.mode == "list":
+        # List is deliberately read-only and prints identifiers locally only.
+        print(monitor.run("get", "--identifiers"))
+    elif args.mode == "status":
+        monitor.status()
+    else:
+        with switch_lock():
+            monitor.switch(args.mode)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Cancelled.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as error:
+        print(f"monitor-mode-mac: {error}", file=sys.stderr)
+        sys.exit(1)

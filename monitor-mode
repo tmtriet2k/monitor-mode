@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Samsung S34CG50 HDMI/PBP CLI for Linux (Hyprland) and macOS (BetterDisplay).
+
+Keep monitor-mode-linux and monitor-mode-mac beside this launcher.
+full selects this computer: HDMI 2 on Linux, HDMI 1 on macOS by default.
+Identifiers remain local; list and status are read-only.
+"""
+
+import argparse
+import os
+from pathlib import Path
+import sys
+
+
+def detect_platform():
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "macos"
+    raise RuntimeError("monitor-mode supports Linux and macOS.")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     allow_abbrev=False)
+    parser.add_argument("mode", nargs="?", default="status",
+                        choices=("hdmi1", "hdmi2", "full", "pbp", "toggle", "status", "list"))
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--serial", help="monitor serial; fallback: MONITOR_SERIAL")
+    target.add_argument("--display", help="Mac display UUID; fallback: MONITOR_MAC_DISPLAY")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="offline switch plan for hdmi1, hdmi2, full, or pbp")
+    parser.add_argument("--platform", choices=("auto", "linux", "macos"), default="auto",
+                        help="auto-detect OS; override only for inspecting dry-run plans")
+    linux = parser.add_argument_group("Linux options")
+    linux.add_argument("--output", help="Hyprland output; fallback: MONITOR_OUTPUT")
+    linux.add_argument("--config", help="Lua monitor configuration path")
+    mac = parser.add_argument_group("macOS options")
+    mac.add_argument("--local-input", choices=("hdmi1", "hdmi2"),
+                     help="Mac input (default: hdmi1); Linux requires hdmi2")
+    mac.add_argument("--backend", help="BetterDisplay executable; fallback: MONITOR_MAC_BACKEND")
+    mac.add_argument("--no-resolution", action="store_true", help="let macOS manage its resolution")
+    args = parser.parse_args(argv)
+    if args.dry_run and args.mode in ("list", "status", "toggle"):
+        parser.error("--dry-run requires hdmi1, hdmi2, full, or pbp")
+    try:
+        native = detect_platform()
+    except RuntimeError:
+        if not args.dry_run or args.platform == "auto":
+            raise
+        native = None
+    platform = native if args.platform == "auto" else args.platform
+    if platform != native and not args.dry_run:
+        parser.error("a different --platform is allowed only with --dry-run")
+    if platform == "linux":
+        if args.display is not None or args.backend is not None or args.no_resolution:
+            parser.error("--display, --backend, and --no-resolution are macOS options")
+        if args.local_input not in (None, "hdmi2"):
+            parser.error("the Linux backend requires the Linux computer on HDMI 2")
+        name = "monitor-mode-linux"
+    else:
+        if args.output is not None or args.config is not None:
+            parser.error("--output and --config are Linux options")
+        name = "monitor-mode-mac"
+    backend = Path(__file__).resolve().with_name(name)
+    if not backend.is_file():
+        raise RuntimeError(f"Missing {name}; save all three scripts from the repository in the same directory.")
+    arguments = [sys.executable, str(backend), args.mode]
+    for flag in ("serial", "display", "output", "config", "local_input", "backend"):
+        value = getattr(args, flag)
+        if value is not None and not (platform == "linux" and flag == "local_input"):
+            arguments += ["--" + flag.replace("_", "-"), value]
+    for flag in ("dry_run", "no_resolution"):
+        if getattr(args, flag):
+            arguments.append("--" + flag.replace("_", "-"))
+    # An argument vector preserves spaces without shell interpolation. Replacing
+    # the launcher also preserves backend exit codes and signal handling.
+    os.execv(sys.executable, arguments)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Cancelled.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as error:
+        print(f"monitor-mode: {error}", file=sys.stderr)
+        sys.exit(1)

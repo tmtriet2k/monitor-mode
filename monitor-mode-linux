@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Switch a Samsung S34CG50 between full screen and equal-split PBP.
+
+Usage: ./monitor-mode --serial SERIAL --output OUTPUT MODE
+Requires ddcutil, Hyprland, and an existing Lua monitor configuration.
+Tested vendor control: E2=0 disables PBP; E2=1 restores the last PBP split.
+HDMI 1 and HDMI 2 use VCP 60 values 0x11 and 0x12 respectively.
+The Linux computer must use HDMI 2; 'full' is an alias for 'hdmi2'.
+'pbp' explicitly restores HDMI 1 + HDMI 2 as the two panes.
+The computer on HDMI 1 must configure its own resolution if needed.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+OUTPUT = None
+CONFIG = Path.home() / ".config/hypr/monitors.lua"
+PROFILE = re.compile(r"^(\s*local samsung_pbp\s*=\s*)(true|false)(\s*(?:--[^\n]*)?)$", re.M)
+DDC = []
+HYPR = ["hyprctl", "-i", os.environ.get("MONITOR_HYPR_INSTANCE", "0")]
+INPUTS = {"hdmi1": 0x11, "hdmi2": 0x12}
+LOCAL_INPUT = INPUTS["hdmi2"]
+
+
+class DDCUnavailable(RuntimeError):
+    """HDMI readback is unavailable; mode writes may still work."""
+
+
+def run(command):
+    result = subprocess.run(command, text=True, capture_output=True, timeout=15)
+    output = result.stdout.strip()
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or output or f"Command failed: {command[0]}")
+    return output
+
+
+def feature(code):
+    last_error = ""
+    for attempt in range(4):
+        try:
+            output = run(DDC + ["getvcp", code, "--brief"])
+            for line in output.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[:2] == ["VCP", code]:
+                    values = [int(p[1:], 16) for p in parts[3:] if re.fullmatch(r"x[0-9a-fA-F]+", p)]
+                    if len(values) == 4:
+                        return (values[2] << 8) | values[3]
+                    if len(values) == 1:
+                        return values[0]
+            last_error = output
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            last_error = str(error)
+        if attempt < 3:
+            time.sleep(1)
+    if re.search(rf"^VCP {code} ERR$", last_error, re.M):
+        raise DDCUnavailable(f"Samsung control {code} readback is unavailable.")
+    raise RuntimeError(f"Cannot read Samsung control {code}: {last_error}")
+
+
+def monitor_mode():
+    value = feature("E2")
+    if value not in (0x3100, 0x3101):
+        raise RuntimeError(f"Unexpected Samsung PBP status 0x{value:04x}; no controls changed.")
+    return bool(value & 1)
+
+
+def desktop():
+    monitors = json.loads(run(HYPR + ["monitors", "-j"]))
+    for monitor in monitors:
+        if monitor.get("name") == OUTPUT:
+            return monitor
+    raise RuntimeError("Samsung display is not active in this Hyprland session.")
+
+
+def saved_mode():
+    text = CONFIG.read_text()
+    matches = list(PROFILE.finditer(text))
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one 'local samsung_pbp' setting in {CONFIG}.")
+    return matches[0].group(2) == "true"
+
+
+def save_mode(pbp):
+    text = CONFIG.read_text()
+    replacement = "true" if pbp else "false"
+    updated, count = PROFILE.subn(lambda m: m.group(1) + replacement + m.group(3), text)
+    if count != 1:
+        raise RuntimeError("Monitor configuration changed; cannot update samsung_pbp.")
+    if updated == text:
+        return
+    # Keep the original configuration and replace the file atomically.
+    backup = CONFIG.with_name(CONFIG.name + ".bak.monitor-mode")
+    if not backup.exists():
+        shutil.copy2(CONFIG, backup)
+    fd, name = tempfile.mkstemp(prefix=".monitors-", suffix=".lua", dir=CONFIG.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(updated)
+        os.chmod(name, CONFIG.stat().st_mode & 0o777)
+        os.replace(name, CONFIG)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def set_monitor_mode(pbp, verify=True):
+    # E2 readback includes a 0x31 prefix, so ddcutil's normal value check
+    # would fail. Verify the actual status ourselves after re-enumeration.
+    last_error = ""
+    for attempt in range(3):
+        try:
+            run(DDC + ["setvcp", "E2", "0x01" if pbp else "0x00", "--noverify"])
+            time.sleep(3)
+            if not verify:
+                return
+            if monitor_mode() == pbp:
+                return
+            last_error = "Monitor has not switched yet."
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            last_error = str(error)
+        if attempt < 2:
+            time.sleep(1)
+    raise RuntimeError(f"PBP switch could not be verified: {last_error}")
+
+
+def set_input(source, fullscreen=False):
+    # Fullscreen selection must be written AFTER PBP is disabled. Its
+    # readback may still match the remembered PBP pane before that write,
+    # so never skip the fullscreen write merely because readback matches.
+    if not fullscreen and feature("60") == source:
+        return
+    for attempt in range(3):
+        run(DDC + ["setvcp", "60", f"0x{source:02x}", "--noverify"])
+        time.sleep(2)
+        try:
+            if feature("60") == source:
+                return
+        except DDCUnavailable:
+            if fullscreen and source != LOCAL_INPUT:
+                return
+            raise
+    raise RuntimeError(f"Could not verify HDMI input selection 0x{source:02x}.")
+
+
+def input_name(source):
+    return {0x11: "HDMI 1", 0x12: "HDMI 2", 0x0f: "DisplayPort"}.get(source, f"input 0x{source:02x}")
+
+
+def set_secondary_pane(source):
+    # E3 writes use (pane index << 8) | source index. Readback packs
+    # primary/secondary source indices into the high/low bytes.
+    # Verified on this S34CG50: E3=0x0101 restores HDMI 2 in pane 1.
+    if source not in (0x00, 0x01, 0x10):
+        raise RuntimeError(f"Unknown PBP source index 0x{source:02x}.")
+    if feature("E3") & 0xff == source:
+        return
+    for attempt in range(3):
+        run(DDC + ["setvcp", "E3", f"0x{0x0100 | source:04x}", "--noverify"])
+        time.sleep(2)
+        if feature("E3") & 0xff == source:
+            return
+    raise RuntimeError("Could not verify the second PBP input.")
+
+
+def reload_config():
+    result = run(HYPR + ["reload"])
+    if result != "ok":
+        raise RuntimeError(f"Hyprland reload failed: {result}")
+    errors = run(HYPR + ["configerrors"])
+    if errors:
+        raise RuntimeError(f"Hyprland configuration error: {errors}")
+
+
+def report():
+    try:
+        pbp = monitor_mode()
+        source = feature("60")
+        state = f"{'PBP' if pbp else 'full screen'}; primary input: {input_name(source)}"
+        if pbp:
+            secondary = feature("E3") & 0xff
+            secondary_name = {0x00: "HDMI 1", 0x01: "HDMI 2", 0x10: "DisplayPort"}.get(secondary, hex(secondary))
+            state += f"; second input: {secondary_name}"
+    except DDCUnavailable:
+        state = "readback unavailable (this machine's HDMI 2 input may be hidden)"
+    try:
+        display = desktop()
+        resolution = f"{display['width']} x {display['height']} at {display['refreshRate']:.2f} Hz"
+    except RuntimeError:
+        resolution = "Samsung output is not active in Hyprland"
+    print(f"Samsung: {state}; Linux desktop: {resolution}; "
+          f"saved profile: {'pbp' if saved_mode() else 'full'}")
+
+
+def verify_desktop(pbp):
+    expected = (1720, 1440) if pbp else (3440, 1440)
+    for attempt in range(8):
+        display = desktop()
+        if (display['width'], display['height']) == expected:
+            return
+        time.sleep(1)
+    raise RuntimeError(f"Desktop did not reach {expected[0]} x {expected[1]}.")
+
+
+def restore(previous_monitor, previous_source, previous_secondary, previous_saved):
+    errors = []
+    try:
+        # Recover DDC access before selecting the original source.
+        set_monitor_mode(True)
+        if previous_source is not None:
+            set_input(previous_source)
+        if previous_monitor and previous_secondary is not None:
+            set_secondary_pane(previous_secondary)
+        if not previous_monitor:
+            set_monitor_mode(False, verify=False)
+            if previous_source is not None:
+                set_input(previous_source, fullscreen=True)
+    except Exception as error:
+        errors.append(str(error))
+    # Restore the desktop even if hardware recovery failed.
+    try:
+        save_mode(previous_saved)
+        reload_config()
+    except Exception as error:
+        errors.append(str(error))
+    if errors:
+        print("Recovery needs attention: " + "; ".join(errors), file=sys.stderr)
+        print("Use the monitor menu to restore PBP, then retry monitor-mode pbp with the same settings.", file=sys.stderr)
+
+
+def main():
+    global OUTPUT, CONFIG, DDC
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--serial", default=os.environ.get("MONITOR_SERIAL"),
+                        help="monitor serial from ddcutil detect; defaults to MONITOR_SERIAL")
+    parser.add_argument("--output", default=os.environ.get("MONITOR_OUTPUT"),
+                        help="Hyprland output name; defaults to MONITOR_OUTPUT")
+    parser.add_argument("--config", type=Path, default=CONFIG,
+                        help="Lua monitor configuration (default: ~/.config/hypr/monitors.lua)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print a switch plan without calling ddcutil or Hyprland")
+    parser.add_argument("mode", nargs="?", default="status",
+                        choices=("hdmi1", "hdmi2", "full", "pbp", "toggle", "status", "list"))
+    args = parser.parse_args()
+    if args.dry_run and args.mode in ("status", "list", "toggle"):
+        parser.error("--dry-run requires hdmi1, hdmi2, full, or pbp")
+    if args.mode != "list" and (not args.serial or not args.serial.strip()):
+        parser.error("set --serial or MONITOR_SERIAL to select your monitor explicitly")
+    if args.mode != "list" and (not args.output or not args.output.strip()):
+        parser.error("set --output or MONITOR_OUTPUT to select your Hyprland output explicitly")
+    OUTPUT = args.output
+    CONFIG = args.config.expanduser()
+    DDC = ["ddcutil", "--sn", args.serial, "--disable-dynamic-sleep", "--sleep-multiplier", "1"]
+    if args.dry_run:
+        target = args.mode == "pbp"
+        source = INPUTS.get(args.mode, LOCAL_INPUT)
+        print("Dry run: no commands sent. Actual switching reads the current state and skips redundant writes.")
+        print("DDC write: VCP 0xE2 = 0x0001 (if PBP is currently disabled)")
+        if target:
+            print("DDC write: VCP 0x60 = 0x0011")
+            print("DDC write: VCP 0xE3 = 0x0101")
+        print(f"Linux profile: samsung_pbp = {'true' if target else 'false'}; reload Hyprland")
+        print("Linux resolution: " + ("1720x1440" if target else "3440x1440"))
+        if not target:
+            print("DDC write: VCP 0xE2 = 0x0000")
+            print(f"DDC write: VCP 0x60 = 0x{source:04X}")
+        return
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("This backend runs on Linux. Use --dry-run to inspect a plan elsewhere.")
+    for dependency in ("ddcutil", "hyprctl"):
+        if not shutil.which(dependency):
+            raise RuntimeError(f"Required command is missing: {dependency}")
+    if args.mode == "list":
+        print(run(["ddcutil", "detect"]))
+        print(run(HYPR + ["monitors"]))
+        return
+    if args.mode == "status":
+        report()
+        return
+
+    state_dir = Path.home() / ".local/state/monitor-mode"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with (state_dir / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another monitor-mode switch is already running.")
+        previous_saved = saved_mode()
+        errors = run(HYPR + ["configerrors"])
+        if errors:
+            raise RuntimeError(f"Fix existing Hyprland configuration errors first: {errors}")
+        try:
+            previous_monitor = monitor_mode()
+        except DDCUnavailable:
+            # A full-screen HDMI 1 hides this machine's HDMI 2. Enable PBP
+            # briefly to regain readback; this is also how switching back works.
+            previous_monitor = False
+        previous_source = None
+        previous_secondary = None
+        target = not previous_monitor if args.mode == "toggle" else args.mode == "pbp"
+        target_source = INPUTS["hdmi1"] if target else INPUTS.get(args.mode, LOCAL_INPUT)
+        label = "PBP" if target else f"{input_name(target_source)} full screen"
+        print(f"Switching Samsung to {label}...", flush=True)
+        try:
+            if not previous_monitor:
+                set_monitor_mode(True)
+            previous_source = feature("60")
+            previous_secondary = feature("E3") & 0xff
+            if target:
+                set_input(target_source)
+                set_secondary_pane(0x01)
+                if feature("E3") != 0x0001:
+                    raise RuntimeError("PBP did not restore the HDMI 1 + HDMI 2 pair.")
+            save_mode(target)
+            reload_config()
+            time.sleep(2)
+            verify_desktop(target)
+            if not target:
+                set_monitor_mode(False, verify=False)
+                set_input(target_source, fullscreen=True)
+                try:
+                    if monitor_mode():
+                        raise RuntimeError("The monitor is still in PBP mode.")
+                except DDCUnavailable:
+                    if target_source == LOCAL_INPUT:
+                        raise
+            report()
+        except (Exception, KeyboardInterrupt):
+            print("Switch failed; restoring the previous monitor mode and profile...", file=sys.stderr)
+            restore(previous_monitor, previous_source, previous_secondary, previous_saved)
+            raise
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Cancelled.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as error:
+        print(f"monitor-mode: {error}", file=sys.stderr)
+        sys.exit(1)
