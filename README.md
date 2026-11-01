@@ -43,6 +43,22 @@ export MONITOR_OUTPUT='YOUR_HYPRLAND_OUTPUT'
 
 Your Hyprland setup must already load `~/.config/hypr/monitors.lua` or a path passed with `--config PATH`. That file must contain exactly one `local samsung_pbp = false` (or `true`) setting and use it to select **3440x1440** for full screen and **1720x1440** for PBP on reload.
 
+If `preferred` keeps selecting the half-width PBP mode after switching to full screen, configure explicit timings for both profiles. This S34CG50 example uses monitor-advertised timings tested at approximately **50 Hz full screen** and **60 Hz PBP**. Replace the output placeholder and adjust the scale for your desktop:
+
+```lua
+local samsung_pbp = false
+hl.monitor({
+  output = "YOUR_HYPRLAND_OUTPUT",
+  mode = samsung_pbp
+    and "modeline 167.00 1720 1768 1800 1880 1440 1443 1453 1481 +hsync -vsync"
+    or "modeline 265.25 3440 3488 3520 3600 1440 1443 1453 1474 +hsync -vsync",
+  position = "auto",
+  scale = 1,
+})
+```
+
+Use timings supported by your monitor and HDMI connection. The 50 Hz full-screen mode worked on the tested connection where the monitor's 60 Hz full-screen timing was rejected. The backend changes the profile flag; it does not choose refresh rates or create missing modes.
+
 The Linux backend was extracted from a Lua-based Hyprland setup. It does not create this configuration or adapt a standard `hyprland.conf` setup. `MONITOR_HYPR_INSTANCE` selects the Hyprland instance (default `0`). `--serial` and `--output` override their environment settings.
 
 ## Set up macOS
@@ -98,6 +114,8 @@ The backends remain directly runnable for compatibility. Platform-specific optio
 Samsung-specific controls are VCP `60` for HDMI input, vendor `E2` for PBP, and vendor `E3` for the secondary pane. Other monitor models require verification and adaptation.
 
 Linux switching updates the Lua profile and reloads Hyprland. The first profile change creates a sibling `.bak.monitor-mode` backup; a lock under `~/.local/state/monitor-mode/` prevents concurrent Linux switches. Failures attempt to restore the previous monitor state and configuration.
+
+Full-screen switching disables PBP and selects the HDMI input before checking the desktop resolution. For local HDMI 2, it reapplies the full-screen profile after the hardware switch to recover from a fallback mode selected while PBP was active. A handoff to HDMI 1 skips the Linux resolution check because that input belongs to the other computer. PBP still verifies the local 1720x1440 desktop.
 
 Mac switching reads PBP and input state, plus the desktop mode when resolution management is enabled, before sending writes. Unexpected or unreadable initial state stops the operation. Ordinary failures attempt recovery. A lock under `~/Library/Application Support/monitor-mode/` prevents concurrent Mac switches.
 

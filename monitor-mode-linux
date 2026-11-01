@@ -269,10 +269,15 @@ def main():
             print("DDC write: VCP 0x60 = 0x0011")
             print("DDC write: VCP 0xE3 = 0x0101")
         print(f"Linux profile: samsung_pbp = {'true' if target else 'false'}; reload Hyprland")
-        print("Linux resolution: " + ("1720x1440" if target else "3440x1440"))
         if not target:
             print("DDC write: VCP 0xE2 = 0x0000")
             print(f"DDC write: VCP 0x60 = 0x{source:04X}")
+        if target or source == LOCAL_INPUT:
+            if not target:
+                print("Linux profile: reapply full-screen timings after the HDMI switch")
+            print("Linux resolution check: " + ("1720x1440" if target else "3440x1440"))
+        else:
+            print("Linux resolution check: skipped (HDMI 1 belongs to the other computer)")
         return
     if not sys.platform.startswith("linux"):
         raise RuntimeError("This backend runs on Linux. Use --dry-run to inspect a plan elsewhere.")
@@ -323,7 +328,6 @@ def main():
             save_mode(target)
             reload_config()
             time.sleep(2)
-            verify_desktop(target)
             if not target:
                 set_monitor_mode(False, verify=False)
                 set_input(target_source, fullscreen=True)
@@ -333,6 +337,15 @@ def main():
                 except DDCUnavailable:
                     if target_source == LOCAL_INPUT:
                         raise
+            # PBP advertises a half-width preferred mode. Wait until the
+            # hardware switch before checking the full-width desktop. HDMI 1
+            # belongs to the other computer and can hide this Linux output.
+            if target or target_source == LOCAL_INPUT:
+                # A mode rejected during PBP can leave Hyprland on a fallback.
+                # Reapply native timings once the full-width input is visible.
+                if not target:
+                    reload_config()
+                verify_desktop(target)
             report()
         except (Exception, KeyboardInterrupt):
             print("Switch failed; restoring the previous monitor mode and profile...", file=sys.stderr)
